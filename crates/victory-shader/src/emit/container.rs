@@ -72,7 +72,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
     // Validator 1.6 writes one name per element in element order, repeats
     // included, except that system values share theirs (it keys names by
     // the semantic's string, which is one static string per system value);
-    // the rows sorted by register (unallocated last).
+    // the rows sorted by register (unallocated last), then name offset.
     let mut offsets: Vec<u32> = Vec::new();
     let mut next = 8 + 32 * elements.len() as u32;
     let mut names = Vec::new();
@@ -90,7 +90,7 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
         }
     }
     let mut order: Vec<usize> = (0..elements.len()).collect();
-    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), elements[i].col));
+    order.sort_by_key(|&i| (elements[i].row.unwrap_or(u32::MAX), offsets[i]));
     for i in order {
         let (e, offset) = (&elements[i], offsets[i]);
         let used = e.usage << e.col;
@@ -399,6 +399,35 @@ fn md5_block(state: &mut [u32; 4], block: &[u8; 64]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn signature_register_ties_follow_name_offsets() -> Result<(), crate::ShaderError> {
+        // Packed elements can occur in metadata before a lower column in
+        // the same register. DXC sorts by name offset, not component.
+        let elements: Vec<_> = [(1, 3, 1), (0, 0, 4), (1, 0, 3)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (row, col, cols))| SigElement {
+                name: "TEXCOORD".into(),
+                index: index as u32,
+                kind: 0,
+                comp: 9,
+                interp: 2,
+                row: Some(row),
+                col,
+                cols,
+                usage: 0,
+                half: false,
+            })
+            .collect();
+        for input in [true, false] {
+            let bytes = signature(&elements, input);
+            let parsed = super::super::signature(&bytes)?;
+            let indices: Vec<_> = parsed.iter().map(|e| e.index).collect();
+            assert_eq!(indices, [1, 0, 2]);
+        }
+        Ok(())
+    }
 
     #[test]
     fn md5_core_matches_the_standard() {
