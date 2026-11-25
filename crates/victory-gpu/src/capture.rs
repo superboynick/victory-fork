@@ -5,6 +5,8 @@
 //! `VICTORY_CAPTURE_AT=3,10,25.5`: seconds since the first presented frame,
 //! saved as `frame-at-<seconds>.png` (one decimal), in the current directory
 //! unless `VICTORY_CAPTURE` specifies a folder. No image buffers are reserved.
+//! `VICTORY_CAPTURE_DEPTH=1`: also save the frame's last bound depth target,
+//! normalized per frame, as `<same-name>-depth.png`.
 
 use std::path::PathBuf;
 
@@ -12,6 +14,14 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
 static DISABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static DEPTH: std::sync::Mutex<Option<(u64, std::sync::Arc<crate::resource::HostTexture>)>> = std::sync::Mutex::new(None);
+static DEPTH_READ: std::sync::Mutex<Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+    std::sync::Arc<crate::resource::HostTexture>)>> = std::sync::Mutex::new(None);
+
+fn depth_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_DEPTH").is_some_and(|v| v == "1"))
+}
 
 struct TimedCapture {
     times: Vec<std::time::Duration>,
@@ -249,14 +259,18 @@ fn numbered(n: u64) -> bool {
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
 pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+    save_named(n, "", width, height, pitch, bgra, rows);
+}
+
+fn save_named(n: u64, suffix: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
     if numbered(n) {
-        save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
+        save_as(&format!("frame-{n}{suffix}"), width, height, pitch, bgra, rows);
     }
     if let Some(at) = timed() {
         let at = at.lock().unwrap_or_else(|e| e.into_inner());
         if at.frame == Some(n) {
             for time in &at.times[at.due.clone()] {
-                save_as(&format!("frame-at-{:.1}", time.as_secs_f64()), width, height, pitch, bgra, rows);
+                save_as(&format!("frame-at-{:.1}{suffix}", time.as_secs_f64()), width, height, pitch, bgra, rows);
             }
         }
     }
@@ -336,7 +350,62 @@ pub(crate) fn read_back(
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
 ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
-    read_back_of(device, list, texture, 0)
+    let colour = read_back_of(device, list, texture, 0)?;
+    if depth_on() {
+        if let Ok(mut pending) = DEPTH_READ.lock() {
+            *pending = read_depth(device, list);
+        }
+    }
+    Some(colour)
+}
+
+fn read_depth(device: &ID3D12Device, list: &ID3D12GraphicsCommandList)
+    -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT, std::sync::Arc<crate::resource::HostTexture>)> {
+    let (frame, copy) = DEPTH.lock().ok()?.take()?;
+    if frame != crate::queue::presented() { return None; }
+    let texture = &copy.texture;
+    // SAFETY: the retained host copy owns this live resource.
+    let d = unsafe { texture.GetDesc() };
+    if !matches!(d.Format, DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_D32_FLOAT
+        | DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT
+        | DXGI_FORMAT_R24G8_TYPELESS | DXGI_FORMAT_D24_UNORM_S8_UINT
+        | DXGI_FORMAT_R16_TYPELESS | DXGI_FORMAT_D16_UNORM)
+        || d.SampleDesc.Count != 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| tracing::warn!(format = d.Format.0, "depth capture skipped: unsupported format or layout"));
+        return None;
+    }
+    // Preflight independently: a depth failure must never disable colour capture.
+    let mut f = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+    let mut total = 0;
+    // SAFETY: one valid subresource, initialized footprint and size outputs.
+    unsafe { device.GetCopyableFootprints(&d, 0, 1, 0, Some(&mut f), None, None, Some(&mut total)); }
+    let p = f.Footprint;
+    let padded = u64::from(p.RowPitch).checked_mul(u64::from(p.Height)).map(|n| n.max(total));
+    let converted = u64::from(p.Width).checked_mul(u64::from(p.Height)).and_then(|n| n.checked_mul(12));
+    // Plane footprints can be narrower than their combined depth/stencil resource.
+    let bpp = match p.Format {
+        DXGI_FORMAT_R16_TYPELESS | DXGI_FORMAT_D16_UNORM | DXGI_FORMAT_R16_UNORM => 2,
+        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_D32_FLOAT_S8X24_UINT | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS => 8,
+        _ => 4,
+    };
+    if p.Width == 0 || p.Height == 0 || total == 0 || p.Depth != 1 || f.Offset != 0
+        || !u64::from(p.Width).checked_mul(bpp).is_some_and(|n| n <= u64::from(p.RowPitch))
+        || ![padded, converted].iter().all(|n| n.is_some_and(|n| n > 0 && n <= 536_870_912)) {
+        static WARN: std::sync::Once = std::sync::Once::new();
+        WARN.call_once(|| tracing::warn!(?p, total, ?padded, ?converted, "depth capture skipped: invalid layout, overflow or size limit"));
+        return None;
+    }
+    let state = D3D12_RESOURCE_STATES(crate::host::legal_state(texture, copy.state.load(std::sync::atomic::Ordering::Relaxed)) as i32);
+    let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    // SAFETY: record beside the colour copy in the same open list; restore state.
+    let read = unsafe {
+        if state != source { list.ResourceBarrier(&[crate::host::transition(texture, state, source)]); }
+        let read = read_back_of(device, list, texture, 0);
+        if state != source { list.ResourceBarrier(&[crate::host::transition(texture, source, state)]); }
+        read
+    }?;
+    Some((read.0, read.1, copy))
 }
 
 /// As [`read_back`], of subresource `sub` (the stencil plane of a
@@ -453,6 +522,26 @@ pub(crate) fn save_read_back(
         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
         buffer.Unmap(0, None);
     }
+    if depth_on() && let Ok(mut pending) = DEPTH_READ.lock()
+        && let Some((buffer, footprint, _keep_alive)) = pending.take() {
+        let f = footprint.Footprint;
+        let Some(len) = (f.RowPitch as usize).checked_mul(f.Height as usize) else { return };
+        let Some(pitch) = (f.Width as usize).checked_mul(4) else { return };
+        let mut data = std::ptr::null_mut();
+        // SAFETY: the same submission as colour finished; preflight bounded the mapping.
+        unsafe {
+            if buffer.Map(0, None, Some(&mut data)).is_err() { return; }
+            if !data.is_null() {
+                let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+                // R16_TYPELESS is UNORM depth here, never a half float.
+                let format = if f.Format == DXGI_FORMAT_R16_TYPELESS { 55 } else { f.Format.0 as u32 };
+                if let Some(rgba) = to_rgba(format, f.Width as usize, f.Height as usize, f.RowPitch as usize, rows) {
+                    save_named(frame, "-depth", f.Width, f.Height, pitch, false, &rgba);
+                }
+            }
+            buffer.Unmap(0, None);
+        }
+    }
 }
 
 /// With `VICTORY_DUMP_TARGETS` set: title textures the frames listed in
@@ -472,6 +561,14 @@ fn dump_on() -> bool {
 
 /// Notes a title texture the frame being built renders to or writes.
 pub(crate) fn note_target(resource: crate::object::This) {
+    if depth_on() && folder().is_some() && !resource.is_null()
+        && let Some(copy) = crate::resource::host_copy(resource) {
+        // SAFETY: a live host copy; only actual depth resources qualify.
+        if unsafe { copy.texture.GetDesc() }.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL)
+            && let Ok(mut depth) = DEPTH.lock() {
+            *depth = Some((crate::queue::presented().saturating_add(1), copy));
+        }
+    }
     if resource.is_null() || !dump_on()
         || DISABLED.load(std::sync::atomic::Ordering::Relaxed)
         || !listed(crate::queue::presented() + 1) {
@@ -521,7 +618,7 @@ fn dump_one(
             list.list
                 .ResourceBarrier(&[crate::host::transition(texture, state, copy)]);
         }
-        let read = read_back(&host.device, &list.list, texture);
+        let read = read_back_of(&host.device, &list.list, texture, 0);
         // The stencil plane of a depth-stencil target, which the title's
         // lighting reads (material class in the low bits; 0x08 "inside a
         // room", which the lamps of a room are multiplied by): the plane
@@ -736,7 +833,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     } else {
         (0.0, finite.fold(0.0f32, f32::max))
     };
-    let range = (high - low).max(1e-20);
+    let range = if depth_on() && grey && high > low { high - low } else { (high - low).max(1e-20) };
     // How much of the target holds anything: a lit scene and one bright
     // lamp on black have the same highest value.
     let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
@@ -818,6 +915,7 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     let curved = matches!(format, 1..=2 | 9..=10 | 26);
     for v in values {
         let c = v.map(|c| {
+            if depth_on() && grey && !c.is_finite() { return 0; }
             let t = ((c - low) / range).clamp(0.0, 1.0);
             ((if curved { t.cbrt() } else { t }) * 255.0) as u8
         });
@@ -955,20 +1053,34 @@ pub(crate) fn recent_levels() -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn capture_times_reject_the_entire_invalid_list() {
-        for value in ["", "5,", "5,no", "-1", "NaN", "inf", "1e300"] {
-            assert!(super::parse_times(value).is_none(), "{value}");
+    fn depth_planes_normalize_their_range_and_ignore_stencil() {
+        for (format, pitch, bytes) in [
+            (40, 8, [0.25f32, 0.75].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>()),
+            (45, 8, [0xff000001u32, 0x0000ffff].into_iter().flat_map(u32::to_le_bytes).collect()),
+            (55, 4, vec![1, 0, 255, 255]),
+            (21, 16, [0.25f32.to_bits(), u32::MAX, 0.75f32.to_bits(), 0].into_iter().flat_map(u32::to_le_bytes).collect()),
+        ] {
+            assert_eq!(super::to_rgba(format, 2, 1, pitch, &bytes), Some(vec![0, 0, 0, 255, 255, 255, 255, 255]));
         }
-        let times = super::parse_times(" 12, 5, 5, 25.5, 0 ").unwrap();
-        assert_eq!(times.iter().map(|t| t.as_secs_f64()).collect::<Vec<_>>(), [0.0, 5.0, 12.0, 25.5]);
+        assert_eq!(super::to_rgba(40, 1, 1, 4, &0.5f32.to_le_bytes()), Some(vec![0, 0, 0, 255]));
     }
 
     #[test]
-    fn capture_times_use_elapsed_time_and_keep_each_frames_decision() {
+    fn capture_times_reject_the_entire_invalid_list() -> Result<(), &'static str> {
+        for value in ["", "5,", "5,no", "-1", "NaN", "inf", "1e300"] {
+            assert!(super::parse_times(value).is_none(), "{value}");
+        }
+        let times = super::parse_times(" 12, 5, 5, 25.5, 0 ").ok_or("valid times rejected")?;
+        assert_eq!(times.iter().map(|t| t.as_secs_f64()).collect::<Vec<_>>(), [0.0, 5.0, 12.0, 25.5]);
+        Ok(())
+    }
+
+    #[test]
+    fn capture_times_use_elapsed_time_and_keep_each_frames_decision() -> Result<(), &'static str> {
         use std::time::{Duration, Instant};
         let start = Instant::now();
         let mut at = super::TimedCapture {
-            times: super::parse_times("5,12,25.5").unwrap(),
+            times: super::parse_times("5,12,25.5").ok_or("valid times rejected")?,
             start: None, frame: None, due: 0..0,
         };
         assert!(!at.wanted(1, start));
@@ -981,6 +1093,7 @@ mod tests {
         assert!(at.wanted(1003, start + Duration::from_secs(26)));
         assert_eq!(at.due, 1..3);
         assert!(!at.wanted(1004, start + Duration::from_secs(27)));
+        Ok(())
     }
 
     #[test]
