@@ -60,9 +60,9 @@
 //! cover [`HostShader::user_data_dwords`]. Stability: these types and the
 //! binding scheme are what pipeline creation builds on; changes are
 //! announced.
-//! * **Signatures** as the console container has them (same semantics,
-//!   registers and masks), so the input layout and stage linking are the
-//!   title's; pixel outputs are plain 32-bit values.
+//! * **Signatures** as the console container has them (same semantics and
+//!   masks), separating conflicting interpolation modes into different host
+//!   registers; stages link by semantic. Pixel outputs are plain 32-bit values.
 //! * **Mesh shaders** ([`HwStage::Ms`], `ms_6_6`): user data and
 //!   descriptors as above (the root constants visible to the mesh stage);
 //!   the pipeline is a mesh pipeline (pipeline-state stream, no input
@@ -1181,7 +1181,12 @@ mod tests {
                 usage,
                 half: false,
             };
-            let isg1 = super::container::signature(&[el("TEXCOORD", 0, 0)], true);
+            let mut coord = el("TEXCOORD", 0, 0);
+            coord.cols = 2;
+            let mut normal = el("NORMAL", 0, 0);
+            normal.col = 2;
+            normal.cols = 2;
+            let isg1 = super::container::signature(&[coord, normal], true);
             let osg1 = super::container::signature(&[el("SV_Target", 16, 15)], false);
             let bytes =
                 crate::dxbc::build(&[(super::FourCC::ISG1, &isg1), (super::FourCC::OSG1, &osg1)]);
@@ -1192,6 +1197,9 @@ mod tests {
                 crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
             let io = crate::io::raise(&p, &native).unwrap();
             let out = super::emit(&c, &native, &p, &st, &io, &res).unwrap();
+            let host = super::Container::parse(&out.dxil).unwrap();
+            let inputs = signature(host.part(FourCC::ISG1).unwrap().data).unwrap();
+            assert_eq!(inputs[0].row == inputs[1].row, input_addr == 1 << 1);
             // dxil.dll, where there is one, checks PSV0 against the module.
             #[cfg(windows)]
             if let Ok(mut v) = super::validator::Validator::load(
@@ -1550,6 +1558,60 @@ mod barycentric_tests {
             usage: 0,
             half: false,
         }
+    }
+
+    #[test]
+    fn signature_packing_separates_modes_and_preserves_elements() {
+        for a in 0..=7 {
+            for b in 0..=7 {
+                let mut s = shader::Shader::new(true);
+                let mut first = element("TEXCOORD", 0, 31);
+                first.cols = 1;
+                first.interp = a;
+                let mut second = first.clone();
+                second.index = 1;
+                second.col = 2;
+                second.interp = b;
+                let mut third = second.clone();
+                third.index = 2;
+                third.col = 3;
+                let mut unpacked = element("SV_Barycentrics", 28, 0);
+                unpacked.row = None;
+                s.inputs = vec![first, second, third, unpacked];
+                s.outputs = s.inputs.clone();
+                s.prims = s.inputs.clone();
+                let before = s.inputs.clone();
+                s.pack_signatures().unwrap();
+                for elements in [&s.inputs, &s.outputs, &s.prims] {
+                    assert_eq!(elements[0].row == elements[1].row, a == b);
+                    assert_eq!(elements[1].row, elements[2].row);
+                    let mut expected = before.clone();
+                    if a != b {
+                        expected[1].row = Some(0);
+                        expected[2].row = Some(0);
+                    }
+                    assert_eq!(*elements, expected);
+                }
+                let packed = s.inputs.clone();
+                s.pack_signatures().unwrap();
+                assert_eq!(s.inputs, packed);
+            }
+        }
+    }
+
+    #[test]
+    fn signature_packing_reports_exhausted_rows() {
+        let mut s = shader::Shader::new(true);
+        s.inputs = (0..32).map(|row| element("TEXCOORD", 0, row)).collect();
+        s.inputs[0].cols = 2;
+        let mut conflict = s.inputs[0].clone();
+        conflict.col = 2;
+        conflict.interp = 1;
+        s.inputs.push(conflict);
+        assert!(matches!(
+            s.pack_signatures(),
+            Err(ShaderError::Unsupported { .. })
+        ));
     }
 
     /// Translates a pixel program with the input VGPRs `input_addr`

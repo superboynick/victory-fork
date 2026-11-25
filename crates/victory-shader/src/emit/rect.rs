@@ -238,6 +238,7 @@ fn build(mut outputs: Vec<SigElement>, ps_inputs: &[SigElement]) -> Result<Vec<u
         }
     }
     s.m.terminate(b, Term::Ret);
+    s.pack_signatures()?;
     Ok(s.finish())
 }
 

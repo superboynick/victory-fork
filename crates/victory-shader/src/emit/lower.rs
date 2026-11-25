@@ -2284,6 +2284,7 @@ impl<'a> Lower<'a> {
         let nonuniform_handles = self.s.nonuniform_handles;
         #[cfg(test)]
         let wave_ops = self.s.flags & flags::WAVE_OPS != 0;
+        self.s.pack_signatures().map_err(Stop::Fail)?;
         let (dxil, wave_size, wave32_reason) = self.s.finish_wave(
             self.x
                 .st

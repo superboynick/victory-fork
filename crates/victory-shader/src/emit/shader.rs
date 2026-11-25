@@ -639,6 +639,38 @@ impl Shader {
         self.annotate(block, h, props.0, props.1)
     }
 
+    /// Separate modes only after lowering has finished using console row numbers.
+    /// DXIL accesses elements by ID and relative column; neither changes here.
+    pub fn pack_signatures(&mut self) -> Result<(), crate::ShaderError> {
+        for elements in [&mut self.inputs, &mut self.outputs, &mut self.prims] {
+            for i in 0..elements.len() {
+                let (Some(row), mode) = (elements[i].row, elements[i].interp) else {
+                    continue;
+                };
+                if !elements[..i]
+                    .iter()
+                    .any(|e| e.row == Some(row) && e.interp != mode)
+                {
+                    continue;
+                }
+                // Keep compatible groups intact and preserve all column masks.
+                let free = (0..32)
+                    .find(|r| !elements.iter().any(|e| e.row == Some(*r)))
+                    .ok_or(crate::ShaderError::Unsupported {
+                        offset: 0,
+                        what: "signature interpolation modes need more than 32 rows",
+                    })?;
+                for e in elements
+                    .iter_mut()
+                    .filter(|e| e.row == Some(row) && e.interp == mode)
+                {
+                    e.row = Some(free);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The finished container.
     pub fn finish(self) -> Vec<u8> {
         self.finish_wave(false, false).0
